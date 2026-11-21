@@ -4,16 +4,15 @@
  * hunshcn/gh-proxy
  * Cloudflare Pages Functions 适配版
  *
- * 原作者：
+ * 原项目：
  * https://github.com/hunshcn/gh-proxy
  *
- * 只修改 Pages 运行入口和内部跳转地址。
- * 原有代理功能及响应头处理尽量保持不变。
+ * 保留原作者代理逻辑，只适配 Pages 入口和 URL 解析。
  */
 
 const ASSET_URL = 'https://hunshcn.github.io/gh-proxy/'
 
-// 自定义路由前缀，根目录部署保持 /
+// 自定义路由前缀
 const PREFIX = '/'
 
 // 分支文件使用 jsDelivr 镜像的开关
@@ -89,15 +88,53 @@ function checkUrl(u) {
 
 
 /**
- * Pages Functions 入口
+ * 解析 Pages 收到的代理路径
  *
- * 原 Worker:
- * addEventListener('fetch', ...)
+ * 支持：
+ * /https://github.com/owner/repo
+ * /http://github.com/owner/repo
+ * /https%3A//github.com/owner/repo
+ * /https%3A%2F%2Fgithub.com/owner/repo
+ * /github.com/owner/repo
  *
- * Pages:
- * export async function onRequest(context)
+ * 只处理协议前缀，不解码后面的路径和查询参数，
+ * 避免破坏 Release 下载签名。
+ */
+function getProxyPath(urlObj) {
+
+    let path = urlObj.pathname.slice(PREFIX.length)
+
+    // 去掉 Pages 路径最前面的斜杠
+    path = path.replace(/^\/+/, '')
+
+    // 兼容冒号被编码为 %3A 的 HTTPS / HTTP
+    path = path.replace(
+        /^(https?)%3A(?:(?:\/|%2F)*)/i,
+        'https://'
+    )
+
+    // 兼容正常协议头以及 Cloudflare 合并斜杠后的格式
+    path = path.replace(
+        /^https?:\/{0,2}/i,
+        'https://'
+    )
+
+    // 保留目标 GitHub URL 的查询参数
+    if (urlObj.search) {
+        path += urlObj.search
+    }
+
+    return path
+}
+
+
+/**
+ * Cloudflare Pages Functions 入口
+ *
+ * 替代原 Worker 的 addEventListener('fetch')
  */
 export async function onRequest(context) {
+
     const req = context.request
 
     try {
@@ -114,8 +151,6 @@ export async function onRequest(context) {
 
 /**
  * 请求处理
- *
- * 保留原作者的 URL 提取逻辑。
  */
 async function fetchHandler(req) {
 
@@ -124,7 +159,7 @@ async function fetchHandler(req) {
 
     let path = urlObj.searchParams.get('q')
 
-    // 保留原作者 q 参数功能
+    // 原作者 q 参数功能
     if (path) {
         return Response.redirect(
             'https://' + urlObj.host + PREFIX + path,
@@ -132,30 +167,16 @@ async function fetchHandler(req) {
         )
     }
 
-    /*
-     * 原作者的关键逻辑：
-     * Cloudflare 会把路径中的 // 合并成 /
-     *
-     * 这里不使用简单的 url.pathname，
-     * 保留原来的 href 截取及协议恢复方式。
-     */
-    path = urlObj.href
-        .slice(urlObj.origin.length + PREFIX.length)
-        .replace(/^https?:\/+/, 'https://')
+    // Pages 专用 URL 解析
+    path = getProxyPath(urlObj)
 
-
-    /*
-     * GitHub Releases / Archive
-     * Gist
-     * Tags
-     * Git Clone
-     */
     if (
         path.search(exp1) === 0 ||
         path.search(exp5) === 0 ||
         path.search(exp6) === 0 ||
         path.search(exp3) === 0
     ) {
+
         return httpHandler(req, path)
 
     } else if (path.search(exp2) === 0) {
@@ -212,7 +233,7 @@ async function fetchHandler(req) {
 /**
  * HTTP 请求处理
  *
- * 保留原作者请求头及请求方法处理。
+ * 保留原作者请求头及请求方法处理
  */
 function httpHandler(req, pathname) {
 
@@ -270,10 +291,7 @@ function httpHandler(req, pathname) {
 
 
 /**
- * 代理核心
- *
- * 原作者的代理逻辑保留。
- * 仅调整 Pages 内部跳转地址。
+ * 原作者代理核心
  */
 async function proxy(urlObj, reqInit) {
 
@@ -284,67 +302,36 @@ async function proxy(urlObj, reqInit) {
 
     const status = res.status
 
-    // 处理上游跳转
+    // 原作者重定向处理
     if (resHdrNew.has('location')) {
 
         let _location = resHdrNew.get('location')
 
-        /*
-         * 相对 Location 先转换为绝对地址。
-         * 避免 Pages 环境解析失败。
-         */
-        const nextUrl = newUrl(_location) ||
-            newUrl(new URL(_location, urlObj).href)
+        if (checkUrl(_location)) {
 
-        if (!nextUrl) {
-            return makeRes('Invalid redirect URL', 502)
-        }
-
-        /*
-         * GitHub 内部跳转：
-         * 改成 Pages 无协议路径。
-         *
-         * 例如：
-         * /github.com/owner/repo/releases/tag/v1
-         *
-         * 不生成：
-         * /https://github.com/owner/repo/...
-         */
-        if (checkUrl(nextUrl.href)) {
-
-            const proxyLocation =
-                PREFIX +
-                nextUrl.hostname +
-                nextUrl.pathname +
-                nextUrl.search
-
+            // 保留原作者的内部 GitHub 跳转处理
             resHdrNew.set(
                 'location',
-                proxyLocation
+                PREFIX + _location
             )
 
         } else {
 
-            /*
-             * 外部下载跳转：
-             *
-             * release-assets.githubusercontent.com
-             * objects.githubusercontent.com
-             *
-             * 保留原作者的递归跟随逻辑。
-             * 不把外部签名 URL 拼接到 Pages 地址。
-             */
+            // 保留原作者的外部跳转跟随
             reqInit.redirect = 'follow'
+
+            const nextUrl = newUrl(_location) ||
+                newUrl(new URL(_location, urlObj).href)
+
+            if (!nextUrl) {
+                return makeRes('Invalid redirect URL', 502)
+            }
 
             return proxy(nextUrl, reqInit)
         }
     }
 
-    /*
-     * 原作者的响应头处理。
-     * 不擅自删除 Content-Encoding、
-     * Content-Length、Content-Disposition 等头。
-     */
+    // 原作者响应头处理，完整保留
     resHdrNew.set(
         'access-control-expose-headers',
         '*'
@@ -355,14 +342,13 @@ async function proxy(urlObj, reqInit) {
         '*'
     )
 
-    // 原作者只删除这三个响应头
     resHdrNew.delete('content-security-policy')
     resHdrNew.delete('content-security-policy-report-only')
     resHdrNew.delete('clear-site-data')
 
-    // 原样传递响应体和其他响应头
+    // 保留原始响应体和其他响应头
     return new Response(res.body, {
         status,
         headers: resHdrNew
     })
-}
+            }
