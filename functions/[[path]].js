@@ -10,15 +10,26 @@ const ALLOWED_HOSTS = new Set([
   'codeload.github.com'
 ]);
 
+// GitHub URL 路径白名单
 const GITHUB_PATH_PATTERNS = [
   /^\/[^/]+\/[^/]+\/(?:releases|archive)\/.+/i,
   /^\/[^/]+\/[^/]+\/(?:blob|raw)\/.+/i,
   /^\/[^/]+\/[^/]+\/(?:info\/refs|git-upload-pack|git-receive-pack)$/i,
-  /^\/[^/]+\/[^/]+\/tags(?:\/.*)?$/i,
+  /^\/[^/]+\/[^/]+\/tags(?:\/.*)?$/i
 ];
 
+// 检查 GitHub 地址是否合法
 function isAllowedGitHubUrl(url) {
+
   if (!url || url.protocol !== 'https:') {
+    return false;
+  }
+
+  if (url.username || url.password) {
+    return false;
+  }
+
+  if (url.port && url.port !== '443') {
     return false;
   }
 
@@ -42,23 +53,31 @@ function isAllowedGitHubUrl(url) {
     return /^\/[^/]+\/[^/]+\/.+/i.test(path);
   }
 
-  if (host === 'objects.githubusercontent.com' ||
-      host === 'release-assets.githubusercontent.com') {
-    return true;
-  }
-
   if (host === 'codeload.github.com') {
     return /^\/[^/]+\/[^/]+\/.+/i.test(path);
+  }
+
+  if (
+    host === 'objects.githubusercontent.com' ||
+    host === 'release-assets.githubusercontent.com'
+  ) {
+    return true;
   }
 
   return false;
 }
 
+
+// URL 标准化
 function normalizeTargetUrl(rawInput, search = '') {
-  if (!rawInput) return null;
+
+  if (!rawInput) {
+    return null;
+  }
 
   let normalized = rawInput.trim();
 
+  // 修复协议斜杠被合并的问题
   normalized = normalized.replace(
     /^(https?:)\/+/i,
     '$1//'
@@ -69,6 +88,7 @@ function normalizeTargetUrl(rawInput, search = '') {
   }
 
   try {
+
     const target = new URL(normalized);
 
     if (search) {
@@ -76,129 +96,224 @@ function normalizeTargetUrl(rawInput, search = '') {
     }
 
     return target;
+
   } catch {
+
     return null;
+
   }
 }
 
-function corsHeaders(headers, exposeAll = false) {
-  const result = new Headers(headers);
 
-  result.set('Access-Control-Allow-Origin', '*');
+// CORS 响应头
+function withCorsHeaders(headers, exposeAll = false) {
+
+  const out = new Headers(headers);
+
+  out.set('Access-Control-Allow-Origin', '*');
 
   if (exposeAll) {
-    result.set('Access-Control-Expose-Headers', '*');
+    out.set('Access-Control-Expose-Headers', '*');
   }
 
-  result.delete('Content-Security-Policy');
-  result.delete('Content-Security-Policy-Report-Only');
-  result.delete('Clear-Site-Data');
+  out.delete('Content-Security-Policy');
+  out.delete('Content-Security-Policy-Report-Only');
+  out.delete('Clear-Site-Data');
 
-  return result;
+  return out;
 }
 
-function createError(message, status = 502) {
+
+// 错误响应
+function errorResponse(message, status = 502) {
+
   return new Response(message, {
+
     status,
-    headers: corsHeaders({
+
+    headers: withCorsHeaders({
       'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'no-store'
     })
+
   });
+
 }
 
-async function forwardGitHubRequest(request, targetUrl, origin) {
+
+// 过滤请求头
+function prepareRequestHeaders(request) {
+
+  const headers = new Headers();
+
+  const allowedHeaders = [
+
+    'accept',
+    'accept-language',
+    'authorization',
+    'content-type',
+    'range',
+    'if-none-match',
+    'if-modified-since',
+    'if-range',
+    'if-match',
+    'if-unmodified-since',
+    'user-agent',
+    'git-protocol'
+
+  ];
+
+  for (const name of allowedHeaders) {
+
+    const value = request.headers.get(name);
+
+    if (value) {
+      headers.set(name, value);
+    }
+
+  }
+
+  return headers;
+
+}
+
+
+// 处理 GitHub 请求
+async function forwardGitHubRequest(
+  request,
+  targetUrl,
+  origin
+) {
 
   if (!isAllowedGitHubUrl(targetUrl)) {
-    return createError('Forbidden: GitHub URLs only.', 403);
+
+    return errorResponse(
+      'Forbidden: GitHub URLs only.',
+      403
+    );
+
   }
 
   try {
 
-    const reqHeaders = new Headers();
-
-    const allowedRequestHeaders = [
-      'accept',
-      'accept-encoding',
-      'accept-language',
-      'content-type',
-      'range',
-      'if-none-match',
-      'if-modified-since',
-      'if-range',
-      'user-agent',
-      'git-protocol'
-    ];
-
-    for (const name of allowedRequestHeaders) {
-      const value = request.headers.get(name);
-
-      if (value) {
-        reqHeaders.set(name, value);
-      }
-    }
-
     const method = request.method.toUpperCase();
 
-    const bodyAllowed = !['GET', 'HEAD'].includes(method);
+    const bodyAllowed = ![
+      'GET',
+      'HEAD'
+    ].includes(method);
 
-    const upstreamResp = await fetch(targetUrl.toString(), {
-      method,
-      headers: reqHeaders,
-      body: bodyAllowed ? request.body : null,
-      redirect: 'manual'
-    });
+    const reqHeaders = prepareRequestHeaders(request);
 
-    const respHeaders = corsHeaders(
+    // 请求 GitHub 上游
+    const upstreamResp = await fetch(
+      targetUrl.toString(),
+      {
+
+        method,
+
+        headers: reqHeaders,
+
+        body: bodyAllowed
+          ? request.body
+          : null,
+
+        redirect: 'manual'
+
+      }
+    );
+
+    const respHeaders = withCorsHeaders(
       upstreamResp.headers,
       true
     );
 
-    const location = upstreamResp.headers.get('location');
+    // 过滤逐跳响应头
+    const hopByHopHeaders = [
+      'connection',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailer',
+      'transfer-encoding',
+      'upgrade'
+    ];
+
+    for (const name of hopByHopHeaders) {
+      respHeaders.delete(name);
+    }
 
     // 处理 GitHub 重定向
+    const location = upstreamResp.headers.get('location');
+
     if (location) {
 
       let resolvedLocation;
 
       try {
+
         resolvedLocation = new URL(
           location,
           targetUrl.toString()
         );
+
       } catch {
-        return createError('Invalid upstream redirect.', 502);
+
+        return errorResponse(
+          'Invalid upstream redirect.',
+          502
+        );
+
       }
 
+      // 只允许白名单域名之间跳转
       if (!isAllowedGitHubUrl(resolvedLocation)) {
-        return createError(
-          'Blocked: external redirect is not allowed.',
+
+        return errorResponse(
+          'Blocked external redirect: ' +
+          resolvedLocation.hostname,
           403
         );
+
       }
 
+      // 将上游跳转转换为代理地址
       respHeaders.set(
         'Location',
-        `${origin}${PREFIX}${resolvedLocation.toString()}`
+        origin +
+        PREFIX +
+        resolvedLocation.toString()
       );
+
     }
 
-    return new Response(upstreamResp.body, {
-      status: upstreamResp.status,
-      statusText: upstreamResp.statusText,
-      headers: respHeaders
-    });
+    // 流式返回上游响应
+    return new Response(
+      upstreamResp.body,
+      {
+
+        status: upstreamResp.status,
+
+        statusText: upstreamResp.statusText,
+
+        headers: respHeaders
+
+      }
+    );
 
   } catch (error) {
 
-    return createError(
-      'Upstream request failed: ' +
-      (error?.message || 'Unknown error'),
+    return errorResponse(
+      'GitHub upstream error: ' +
+      (error?.message || String(error)),
       502
     );
 
   }
+
 }
+
 
 // Cloudflare Pages Functions 入口
 export async function onRequest(context) {
@@ -207,46 +322,70 @@ export async function onRequest(context) {
 
   const url = new URL(request.url);
 
+
   // CORS 预检
   if (request.method === 'OPTIONS') {
 
     return new Response(null, {
+
       status: 204,
+
       headers: {
+
         'Access-Control-Allow-Origin': '*',
+
         'Access-Control-Allow-Methods':
           'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS',
+
         'Access-Control-Allow-Headers':
           request.headers.get(
             'Access-Control-Request-Headers'
           ) || '*',
+
         'Access-Control-Max-Age': '1728000'
+
       }
+
     });
 
   }
 
-  // q 参数代理入口
+
+  // q 参数兼容
   const queryTarget = url.searchParams.get('q');
 
   if (queryTarget) {
 
-    const parsedQuery = normalizeTargetUrl(queryTarget);
+    const parsedQuery = normalizeTargetUrl(
+      queryTarget
+    );
 
-    if (parsedQuery && isAllowedGitHubUrl(parsedQuery)) {
+    if (
+      parsedQuery &&
+      isAllowedGitHubUrl(parsedQuery)
+    ) {
 
       return Response.redirect(
-        `${url.origin}${PREFIX}${parsedQuery.toString()}`,
+        url.origin +
+        PREFIX +
+        parsedQuery.toString(),
         302
       );
 
     }
 
-    return createError('Invalid GitHub URL.', 400);
+    return errorResponse(
+      'Invalid GitHub URL.',
+      400
+    );
+
   }
 
-  // 获取代理目标地址
+
+  // 获取原始代理路径
+  // 不依赖 context.params，避免动态路由解码差异
   const rawPath = url.pathname.replace(/^\/+/, '');
+
 
   // 首页
   if (!rawPath) {
@@ -254,26 +393,40 @@ export async function onRequest(context) {
     return new Response(
       'GitHub Proxy (Cloudflare Pages) is running.',
       {
+
         status: 200,
-        headers: corsHeaders({
-          'Content-Type': 'text/plain; charset=utf-8'
+
+        headers: withCorsHeaders({
+
+          'Content-Type':
+            'text/plain; charset=utf-8'
+
         })
+
       }
     );
 
   }
 
-  // 解析目标 URL
+
+  // 解析目标地址
   const targetUrl = normalizeTargetUrl(
     rawPath,
     url.search
   );
 
+
   if (!targetUrl) {
-    return createError('Bad Request: invalid URL.', 400);
+
+    return errorResponse(
+      'Bad Request: invalid target URL.',
+      400
+    );
+
   }
 
-  // 转发请求
+
+  // 执行代理
   return forwardGitHubRequest(
     request,
     targetUrl,
