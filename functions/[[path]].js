@@ -4,23 +4,19 @@
  * hunshcn/gh-proxy
  * Cloudflare Pages Functions 适配版
  *
- * 原项目：
- * https://github.com/hunshcn/gh-proxy
- *
- * 保留原作者代理逻辑，只适配 Pages 入口和 URL 解析。
+ * 保留原作者代理功能：
+ * Releases / Archive / Blob / Raw / Gist
+ * Git Clone / Tags / jsDelivr / 白名单
+ * CORS / 上游跳转 / 静态资源
  */
 
 const ASSET_URL = 'https://hunshcn.github.io/gh-proxy/'
-
-// 自定义路由前缀
 const PREFIX = '/'
 
-// 分支文件使用 jsDelivr 镜像的开关
 const Config = {
     jsdelivr: 0
 }
 
-// 白名单
 const whiteList = []
 
 const PREFLIGHT_INIT = {
@@ -41,9 +37,6 @@ const exp5 = /^(?:https?:\/\/)?gist\.(?:githubusercontent|github)\.com\/.+?\/.+?
 const exp6 = /^(?:https?:\/\/)?github\.com\/.+?\/.+?\/tags.*$/i
 
 
-/**
- * 原作者响应函数
- */
 function makeRes(body, status = 200, headers = {}) {
     headers['access-control-allow-origin'] = '*'
 
@@ -54,9 +47,6 @@ function makeRes(body, status = 200, headers = {}) {
 }
 
 
-/**
- * URL 解析
- */
 function newUrl(urlStr) {
     try {
         return new URL(urlStr)
@@ -66,9 +56,6 @@ function newUrl(urlStr) {
 }
 
 
-/**
- * 判断是否为支持的 GitHub URL
- */
 function checkUrl(u) {
     for (let i of [
         exp1,
@@ -88,38 +75,33 @@ function checkUrl(u) {
 
 
 /**
- * 解析 Pages 收到的代理路径
+ * Pages 专用 URL 提取
  *
- * 支持：
- * /https://github.com/owner/repo
- * /http://github.com/owner/repo
- * /https%3A//github.com/owner/repo
- * /https%3A%2F%2Fgithub.com/owner/repo
- * /github.com/owner/repo
+ * 兼容：
+ * https://github.com/...
+ * https:/github.com/...
+ * https%3A//github.com/...
+ * github.com/...
  *
- * 只处理协议前缀，不解码后面的路径和查询参数，
- * 避免破坏 Release 下载签名。
+ * 这是本次修改的核心。
  */
 function getProxyPath(urlObj) {
 
     let path = urlObj.pathname.slice(PREFIX.length)
 
-    // 去掉 Pages 路径最前面的斜杠
-    path = path.replace(/^\/+/, '')
-
-    // 兼容冒号被编码为 %3A 的 HTTPS / HTTP
+    // 兼容协议冒号被编码
     path = path.replace(
-        /^(https?)%3A(?:(?:\/|%2F)*)/i,
-        'https://'
+        /^(https?)%3A/i,
+        '$1:'
     )
 
-    // 兼容正常协议头以及 Cloudflare 合并斜杠后的格式
+    // 兼容协议后的斜杠被编码或被合并
     path = path.replace(
-        /^https?:\/{0,2}/i,
-        'https://'
+        /^(https?):(?:%2F|\/)+/i,
+        '$1://'
     )
 
-    // 保留目标 GitHub URL 的查询参数
+    // 保留原始查询参数
     if (urlObj.search) {
         path += urlObj.search
     }
@@ -130,8 +112,6 @@ function getProxyPath(urlObj) {
 
 /**
  * Cloudflare Pages Functions 入口
- *
- * 替代原 Worker 的 addEventListener('fetch')
  */
 export async function onRequest(context) {
 
@@ -139,7 +119,9 @@ export async function onRequest(context) {
 
     try {
         return await fetchHandler(req)
+
     } catch (err) {
+
         return makeRes(
             'cfworker error:\n' +
             (err.stack || err.message || String(err)),
@@ -154,8 +136,7 @@ export async function onRequest(context) {
  */
 async function fetchHandler(req) {
 
-    const urlStr = req.url
-    const urlObj = new URL(urlStr)
+    const urlObj = new URL(req.url)
 
     let path = urlObj.searchParams.get('q')
 
@@ -167,9 +148,11 @@ async function fetchHandler(req) {
         )
     }
 
-    // Pages 专用 URL 解析
+    // Pages 兼容 URL 提取
     path = getProxyPath(urlObj)
 
+
+    // Releases / Archive / Gist / Tags / Git Clone
     if (
         path.search(exp1) === 0 ||
         path.search(exp5) === 0 ||
@@ -224,7 +207,7 @@ async function fetchHandler(req) {
 
     } else {
 
-        // 原作者静态资源处理
+        // 原作者静态资源
         return fetch(ASSET_URL + path)
     }
 }
@@ -232,14 +215,12 @@ async function fetchHandler(req) {
 
 /**
  * HTTP 请求处理
- *
- * 保留原作者请求头及请求方法处理
  */
 function httpHandler(req, pathname) {
 
     const reqHdrRaw = req.headers
 
-    // preflight
+    // OPTIONS 预检请求
     if (
         req.method === 'OPTIONS' &&
         reqHdrRaw.has('access-control-request-headers')
@@ -247,7 +228,6 @@ function httpHandler(req, pathname) {
         return new Response(null, PREFLIGHT_INIT)
     }
 
-    // 原样复制请求头
     const reqHdrNew = new Headers(reqHdrRaw)
 
     let urlStr = pathname
@@ -291,7 +271,7 @@ function httpHandler(req, pathname) {
 
 
 /**
- * 原作者代理核心
+ * 代理核心
  */
 async function proxy(urlObj, reqInit) {
 
@@ -302,30 +282,38 @@ async function proxy(urlObj, reqInit) {
 
     const status = res.status
 
-    // 原作者重定向处理
+    // 上游跳转处理
     if (resHdrNew.has('location')) {
 
         let _location = resHdrNew.get('location')
 
-        if (checkUrl(_location)) {
+        // 兼容相对跳转地址
+        const nextUrl =
+            newUrl(_location) ||
+            newUrl(new URL(_location, urlObj).href)
 
-            // 保留原作者的内部 GitHub 跳转处理
+        if (!nextUrl) {
+            return makeRes('Invalid redirect URL', 502)
+        }
+
+        if (checkUrl(nextUrl.href)) {
+
+            // GitHub 内部跳转继续走代理
+            const proxyLocation =
+                PREFIX +
+                nextUrl.hostname +
+                nextUrl.pathname +
+                nextUrl.search
+
             resHdrNew.set(
                 'location',
-                PREFIX + _location
+                proxyLocation
             )
 
         } else {
 
-            // 保留原作者的外部跳转跟随
+            // 外部下载地址跟随跳转
             reqInit.redirect = 'follow'
-
-            const nextUrl = newUrl(_location) ||
-                newUrl(new URL(_location, urlObj).href)
-
-            if (!nextUrl) {
-                return makeRes('Invalid redirect URL', 502)
-            }
 
             return proxy(nextUrl, reqInit)
         }
@@ -342,13 +330,13 @@ async function proxy(urlObj, reqInit) {
         '*'
     )
 
+    // 原作者只删除这三个响应头
     resHdrNew.delete('content-security-policy')
     resHdrNew.delete('content-security-policy-report-only')
     resHdrNew.delete('clear-site-data')
 
-    // 保留原始响应体和其他响应头
     return new Response(res.body, {
         status,
         headers: resHdrNew
     })
-            }
+}
